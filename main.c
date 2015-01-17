@@ -21,15 +21,15 @@
  *
  * 									inode table
  *
- * 	  inode 1	inode 2	  inode 3  inode 4   inode 5	inode 6	 inode 7	inode 8	  inode 9  inode 10   inode 11
- *  +---------+---------+---------+---------+---------+---------+---------+---------+---------+---------+---------+
- *  |		  |         |         |         |         |         |         |         |         |         | root dir|
- *  +---------+---------+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ * 	  inode 1	inode 2	  inode 3  inode 4   inode 5	inode 6	 inode 7	inode 8	  inode 9
+ *  +---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ *  |		  |root dir |         |         |         |         |         |         |         |
+ *  +---------+---------+---------+---------+---------+---------+---------+---------+---------+
  *
- *                                                                                                      ^
- *  																						            |
- * 																			         root_inode_index * sizeof(inode)
- *
+ *            ^
+ *  		  |
+ *  	inode_tab_block * block_size +
+ *      (EXT2_ROOT_INO-1) * sizeof(inode)
  *
  *
  */
@@ -42,11 +42,16 @@
 #include <string.h>
 #define SUPERBLOCK_OFFSET 1024
 
+/* used for inode indirection hierarchy */
+enum indirection_level {
+	LEAF, FIRST, SECOND, THIRD
+};
+
 static int fid, /* global variable set by the open() function */
 block_size, /* bytes per sector from disk geometry */
 num_block_groups, /* n= the number of block groups in the file system  */
-inode_tab_block, /* the block number of the first element of the inode table */
-root_inode_index; /* the index of the root dir inode */
+inode_tab_block; /* the block number of the first element of the inode table */
+
 /*
  * parseSuperblock
  *
@@ -127,7 +132,7 @@ struct ext2_inode *getInodeByInodeIndex(int index) {
 	/* the offset where the inode table begins */
 	int offset = inode_tab_block * block_size;
 	/* add the offset of previous inode records.  */
-	offset += (index-1) * sizeof(struct ext2_inode);
+	offset += (index - 1) * sizeof(struct ext2_inode);
 
 	printf("offset=%d inodesz=%d\n", offset, sizeof(struct ext2_inode));
 
@@ -152,18 +157,34 @@ struct ext2_inode *getInodeByInodeIndex(int index) {
 	}
 	return inode;
 }
-struct ext2_dir_entry_2 *findNameInDirBlock(char *name, char *block){
-	struct ext2_dir_entry_2 *dir;
-	char *start=block;
 
-	while (block<start+block_size){
+
+/*
+ * Function:  findNameInDirBlock
+ * --------------------
+ * finds if a given file name exists in a directory block and returns the dir entry if found
+ *
+ *  block: a file block to search for the file name. the block must be one that is pointed to by an inode entry of a directory file type
+ *   name: the name of the file that is being searched for in the directory
+ *
+ *  returns: if name is found, its directory entry is returned, otherwise NULL.
+ *  			caller must free a returned not NULL dir entry
+ *
+ */
+struct ext2_dir_entry_2 *findNameInDirBlock(char *block, char *name) {
+	struct ext2_dir_entry_2 *dir;
+	char *start = block;
+
+	while (block < start + block_size) {
 		dir = (struct ext2_dir_entry_2*) block;
-		if (!strcmp(name,dir->name)) {/*found it*/
-			struct ext2_dir_entry_2 *thedir=malloc(sizeof(struct ext2_dir_entry_2));
-			memcpy(thedir,dir,sizeof(dir));
+		int len=dir->name_len > strlen(name) ? dir->name_len : strlen(name);
+		if (!strncmp(name, dir->name,len)) {/*found it*/
+			struct ext2_dir_entry_2 *thedir = malloc(
+					sizeof(struct ext2_dir_entry_2));
+			memcpy(thedir, dir, sizeof(struct ext2_dir_entry_2));
 			return thedir;
 		}
-		block+=dir->rec_len;
+		block += dir->rec_len;
 	}
 
 	/* not found in this block */
@@ -171,130 +192,155 @@ struct ext2_dir_entry_2 *findNameInDirBlock(char *name, char *block){
 
 }
 
-struct ext2_dir_entry_2 *getSubDir(int inode, char* name){
-
-	struct ext2_inode *in=getInodeByInodeIndex(inode);
+/*
+ * Function:  getLeafBlocks
+ * ------------------------
+ * finds if a given file name exists in a directory block pointed to by block ,and returns the dir entry if found
+ *
+ *  block: a block number pointed to by an inode entry of a directory file type
+ *   name: the name of the file that is being searched for in the directory
+ *
+ *  returns: if name is found, its directory entry is returned, otherwise NULL.
+ *  			caller must free a returned not NULL dir entry
+ */
+struct ext2_dir_entry_2 *getLeafBlocks(__le32 block, char *name) {
+	char *realBlock;
 	struct ext2_dir_entry_2 *dir;
-	int i,block_iter=0;
+	if (!block)
+		return NULL;
+	realBlock = malloc(block_size * sizeof(char));
+	if (!realBlock) {
+		perror("out of memory\n");
+		exit(1);
+	}
+	fd_read(block, realBlock);
+	dir = findNameInDirBlock(realBlock, name);
+	free(realBlock);
+	return dir;
+}
+/*
+ * Function:  getIndirectBlocks
+ * ------------------------
+ *  reads indirect blocks and delegates to lower hierarchy indirection and leaf function to find if a given file name exists in a directory block  ,and returns the dir entry if found
+ *
+ *  block: an indirect block number pointed to by an inode entry of a directory file type
+ *  name: the name of the file that is being searched for in the directory
+ *  level: the indirection hierarchy level FIRST/SECOND/THIRD
+ *
+ *  returns: if name is found, its directory entry is returned, otherwise NULL.
+ *  			caller must free a returned not NULL dir entry
+ */
+struct ext2_dir_entry_2 *getIndirectBlocks(__le32 block, char *name,
+		int level) {
+	__le32 *pointerarray;
+	struct ext2_dir_entry_2 *dir;
+	int i, end = block_size / sizeof(__le32 );
+	/* invalid pointer */
+	if (!block)
+		return NULL;
 
-	if (!in->i_mode & S_IFDIR){
-		printf("getSubDir error! i-node %d is not a directory\n",inode);
-		free (in);
+	pointerarray = malloc(block_size);
+	if (!pointerarray) {
+		perror("out of memory\n");
+		exit(1);
+	}
+
+	/* read block form disk */
+	fd_read(block, pointerarray);
+
+	for (i = 0; i < end && pointerarray[i]; i++) {
+		if (level > LEAF) {
+			dir = getIndirectBlocks(pointerarray[i], name, --level);
+		} else
+			dir = getLeafBlocks(pointerarray[i], name);
+		if (dir) /* found it */
+			return dir;
+	}
+	/* didn;t find it */
+	return NULL;
+}
+/*
+ * Function:  getSubDir
+ * ------------------------
+ * finds if a given file name exists in a directory block pointed to by block ,and returns the dir entry if found
+ *
+ *  block: a block number pointed to by an inode entry of a directory file type
+ *   name: the name of the file that is being searched for in the directory
+ *
+ *  returns: if name is found, its directory entry is returned, otherwise NULL.
+ *  			caller must free a returned not NULL dir entry
+ */
+struct ext2_dir_entry_2 *getSubDir(int inode, char* name) {
+
+	struct ext2_inode in,*pin = getInodeByInodeIndex(inode);
+	struct ext2_dir_entry_2 *dir;
+	int i;
+
+	if (!pin->i_mode & S_IFDIR) {
+		printf("getSubDir error! i-node %d is not a directory\n", inode);
+		free(pin);
 		return NULL;
 	}
 
+	/* get rid of the pointer to indode and free its memory */
+	memcpy(&in,pin,sizeof(in));
+	free(pin);
 
 	/* iterate over the first 12 nodes */
-	for (i = 0; i < 12 && i < in->i_blocks; i++) {
-		char *buff=malloc(block_size*sizeof(char));
-		if (!buff){
-			perror("out of memory\n");
-			exit (1);
-		}
-		fd_read(in->i_block[i],buff);
-		if (dir=findNameInDirBlock(name,buff)){
-			free(buff);
+	for (i = 0; i < 12 &&  in.i_block[i]; i++) {
+		dir = getLeafBlocks(in.i_block[i], name);
+		if (dir) /*found it */
 			return dir;
-		}
 
-		free(buff);
 	}
-	/*not found */
-	return NULL;
+
+	/* the file is smaller than 12 blocks and we havn't found the name */
+	if (!in.i_block[12])
+		return NULL;
+
+	dir = getIndirectBlocks(in.i_block[12], name, FIRST);
+	if (dir)
+		return dir;
+
+	if (!in.i_block[13])
+		return NULL;
+
+	dir = getIndirectBlocks(in.i_block[13], name, SECOND);
+		if (dir)
+			return dir;
+
+	if (!in.i_block[14])
+		return NULL;
+
+	return 	getIndirectBlocks(in.i_block[14], name, THIRD);
 
 }
 
 
 main() {
-	int blocks, size;
-	static char buff[10240], *pBuff, *p2;
+
+
 	struct ext2_dir_entry_2 *dir;
 	__le16 mode;
 	int i;
-	static struct ext2_inode *in;
+
+
+
 	fid = open("/dev/fd0", O_RDWR);
 
-	printf("start\n");
+
+
 	parseSuperblock();
 	parseGroupDescriptor(0);
 
-	dir=getSubDir(2,"b");
-
-	/*in = getInodeByInodeIndex(2);
-
-	printf(" size bytes %d blocks %d uid %d\n", in->i_size, in->i_blocks,
-			in->i_uid);
-
-	mode = in->i_mode;
-	if (mode & S_IFDIR)
-		printf("is Dir\n");
+	dir = getSubDir(EXT2_ROOT_INO, "foo2");
+	if (dir)
+		printf(" dir found <%s>  inode %d\n",dir->name,dir->inode);
 	else
-		printf("not Dir\n");
+		printf("Not Found!\n");
 
-	printf("Block[0]=%d\n", in->i_block[0]);
+	free(dir);
 
-	pBuff = p2 = &buff;
-	fd_read(in->i_block[0], pBuff);
-	pBuff += block_size;
-	fd_read(in->i_block[1], pBuff);
-	pBuff += block_size;
-	fd_read(in->i_block[2], pBuff);
-	dir = (struct ext2_dir_entry_2*) p2;
-	printf("name=%s  name len %d  rec len %d inode %d\n", dir->name,
-			dir->name_len, dir->rec_len, dir->inode);
-	p2 += dir->rec_len;
-	dir = (struct ext2_dir_entry_2*) p2;
-	printf("name=%s  name len %d  rec len %d inode %d\n", dir->name,
-			dir->name_len, dir->rec_len, dir->inode);
-	p2 += dir->rec_len;
-	dir = (struct ext2_dir_entry_2*) p2;
-	printf("name=%s  name len %d  rec len %d inode %d\n", dir->name,
-			dir->name_len, dir->rec_len, dir->inode);
-	p2 += dir->rec_len;
-	dir = (struct ext2_dir_entry_2*) p2;
-	printf("name=%s  name len %d  rec len %d inode %d\n", dir->name,
-			dir->name_len, dir->rec_len, dir->inode);
-	p2 += dir->rec_len;
-	dir = (struct ext2_dir_entry_2*) p2;
-	printf("name=%s  name len %d  rec len %d inode %d\n", dir->name,
-			dir->name_len, dir->rec_len, dir->inode);
-
-	in = getInodeByInodeIndex(12);
-
-	printf(" size bytes %d blocks %d uid %d\n", in->i_size, in->i_blocks,
-			in->i_uid);
-
-	mode = in->i_mode;
-	if (mode & S_IFDIR)
-		printf("is Dir\n");
-	else
-		printf("not Dir\n");
-
-
-
-	pBuff = p2 = &buff;
-		fd_read(in->i_block[0], pBuff);
-		pBuff += block_size;
-		fd_read(in->i_block[1], pBuff);
-		pBuff += block_size;
-		fd_read(in->i_block[2], pBuff);
-		dir = (struct ext2_dir_entry_2*) p2;
-		printf("name=%s  name len %d  rec len %d inode %d\n", dir->name,
-				dir->name_len, dir->rec_len, dir->inode);
-		p2 += dir->rec_len;
-		dir = (struct ext2_dir_entry_2*) p2;
-		printf("name=%s  name len %d  rec len %d inode %d\n", dir->name,
-				dir->name_len, dir->rec_len, dir->inode);
-		p2 += dir->rec_len;
-		dir = (struct ext2_dir_entry_2*) p2;
-		printf("name=%s  name len %d  rec len %d inode %d\n", dir->name,
-				dir->name_len, dir->rec_len, dir->inode);
-		p2 += dir->rec_len;
-		dir = (struct ext2_dir_entry_2*) p2;
-		printf("name=%s  name len %d  rec len %d inode %d\n", dir->name,
-				dir->name_len, dir->rec_len, dir->inode);
-	free(in);
-*/
 	close(fid);
 
 }
