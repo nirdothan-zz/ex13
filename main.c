@@ -48,7 +48,9 @@ enum indirection_level {
 	LEAF, FIRST, SECOND, THIRD
 };
 
-enum operation_mode {SEARCH, PRINT};
+enum operation_mode {
+	SEARCH, PRINT
+};
 
 static int fid, /* global variable set by the open() function */
 block_size, /* bytes per sector from disk geometry */
@@ -96,13 +98,16 @@ int fd_read(int block_number, char *buffer) {
 	if (dest != block_number * block_size) {
 		printf("invalid EXT2 file: cannot seek block number [%d]\n",
 				block_number);
-		exit(1);
+		close(fid);
+		return -1;
 	}
 	len = read(fid, buffer, block_size);
 	if (len != block_size) {
 		printf(
 				"invalid EXT2 file: cannot read  block number [%d]. Read only %d bytes\n",
 				block_number, len);
+		close(fid);
+		return -1;
 	}
 	return len;
 }
@@ -136,8 +141,6 @@ struct ext2_inode *getInodeByInodeIndex(int index) {
 	int offset = inode_tab_block * block_size;
 	/* add the offset of previous inode records.  */
 	offset += (index - 1) * sizeof(struct ext2_inode);
-
-
 
 	if (index < 1)
 		return NULL;
@@ -193,7 +196,17 @@ struct ext2_dir_entry_2 *findNameInDirBlock(char *block, char *name) {
 	return NULL;
 
 }
-
+/*
+ * Function:  printDirEntriesInBlock
+ * --------------------
+ *  prints all files listed in a given data block, assuming the data block is part of a directory file
+ *
+ *  block: a data block to print its file entries. the block must be one that is pointed to by an inode entry of a directory file type
+ *
+ *
+ *  returns: void
+ *
+ */
 void *printDirEntriesInBlock(char *block) {
 	struct ext2_dir_entry_2 *dir;
 	struct ext2_inode *in;
@@ -201,23 +214,19 @@ void *printDirEntriesInBlock(char *block) {
 	struct tm *timeinfo;
 	char buf[80];
 
-
-
-
 	while (block < start + block_size) {
 		dir = (struct ext2_dir_entry_2*) block;
-		in=getInodeByInodeIndex(dir->inode);
+		in = getInodeByInodeIndex(dir->inode);
 
-		  timeinfo = localtime(&in->i_ctime);
+		timeinfo = localtime(&in->i_ctime);
 
-		  strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M ", timeinfo);
-		    printf("%s %s\n", buf,dir->name);
+		strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M ", timeinfo);
+		printf("%s %.*s\n",  buf, dir->name_len, dir->name);
 
 		block += dir->rec_len;
 
 		free(in);
 	}
-
 
 }
 
@@ -234,7 +243,7 @@ void *printDirEntriesInBlock(char *block) {
  */
 struct ext2_dir_entry_2 *getLeafBlocks(__le32 block, char *name, int mode) {
 	char *realBlock;
-	struct ext2_dir_entry_2 *dir=0;
+	struct ext2_dir_entry_2 *dir = 0;
 	if (!block)
 		return NULL;
 	realBlock = malloc(block_size * sizeof(char));
@@ -244,10 +253,10 @@ struct ext2_dir_entry_2 *getLeafBlocks(__le32 block, char *name, int mode) {
 	}
 	fd_read(block, realBlock);
 
-	if (mode==SEARCH)
+	if (mode == SEARCH)
 		dir = findNameInDirBlock(realBlock, name);
 	else
-		 printDirEntriesInBlock(realBlock);
+		printDirEntriesInBlock(realBlock);
 	free(realBlock);
 	return dir;
 }
@@ -263,7 +272,8 @@ struct ext2_dir_entry_2 *getLeafBlocks(__le32 block, char *name, int mode) {
  *  returns: if name is found, its directory entry is returned, otherwise NULL.
  *  			caller must free a returned not NULL dir entry
  */
-struct ext2_dir_entry_2 *getIndirectBlocks(__le32 block, char *name, int level,int mode) {
+struct ext2_dir_entry_2 *getIndirectBlocks(__le32 block, char *name, int level,
+		int mode) {
 	__le32 *pointerarray;
 	struct ext2_dir_entry_2 *dir;
 	int i, end = block_size / sizeof(__le32 );
@@ -282,9 +292,9 @@ struct ext2_dir_entry_2 *getIndirectBlocks(__le32 block, char *name, int level,i
 
 	for (i = 0; i < end && pointerarray[i]; i++) {
 		if (level > LEAF) {
-			dir = getIndirectBlocks(pointerarray[i], name, --level,mode);
+			dir = getIndirectBlocks(pointerarray[i], name, --level, mode);
 		} else
-			dir = getLeafBlocks(pointerarray[i], name,mode);
+			dir = getLeafBlocks(pointerarray[i], name, mode);
 		if (dir) /* found it */
 			return dir;
 	}
@@ -320,7 +330,7 @@ struct ext2_dir_entry_2 *getSubDir(int inode, char* name, int mode) {
 
 	/* iterate over the first 12 nodes */
 	for (i = 0; i < 12 && in.i_block[i]; i++) {
-		dir = getLeafBlocks(in.i_block[i], name,mode);
+		dir = getLeafBlocks(in.i_block[i], name, mode);
 		if (dir) /*found it */
 			return dir;
 
@@ -330,24 +340,33 @@ struct ext2_dir_entry_2 *getSubDir(int inode, char* name, int mode) {
 	if (!in.i_block[12])
 		return NULL;
 
-	dir = getIndirectBlocks(in.i_block[12], name, FIRST,mode);
+	dir = getIndirectBlocks(in.i_block[12], name, FIRST, mode);
 	if (dir)
 		return dir;
 
 	if (!in.i_block[13])
 		return NULL;
 
-	dir = getIndirectBlocks(in.i_block[13], name, SECOND,mode);
+	dir = getIndirectBlocks(in.i_block[13], name, SECOND, mode);
 	if (dir)
 		return dir;
 
 	if (!in.i_block[14])
 		return NULL;
 
-	return getIndirectBlocks(in.i_block[14], name, THIRD,mode);
+	return getIndirectBlocks(in.i_block[14], name, THIRD, mode);
 
 }
-
+/*
+ * Function:  isValidDirectory
+ * ------------------------
+ * finds if a given path is a valid directory path
+ *
+ *  path: the full path being validated
+ *
+ *  returns: inode number in case of valid directory or 0 in case not valid
+ *
+ */
 __le32 isValidDirectory(char *path) {
 	struct ext2_dir_entry_2 *dir;
 	char s[2] = "/";
@@ -368,18 +387,18 @@ __le32 isValidDirectory(char *path) {
 
 	/* get the first sub dir from the root dir */
 
-	inode=EXT2_ROOT_INO;
-
+	inode = EXT2_ROOT_INO;
 
 	while (fileEntry != NULL) {
 
-		dir = getSubDir(inode, fileEntry,SEARCH);
-		if (dir->file_type!=EXT2_FT_DIR){
+		dir = getSubDir(inode, fileEntry, SEARCH);
+		/* file entry dosn't exist in dir or file is not a directory */
+		if (!dir || dir->file_type != EXT2_FT_DIR) {
 			free(dir);
 			free(path_cp);
-			return 0; /*not a directory */
+			return 0; /*not a valid directory */
 		}
-		inode=dir->inode;
+		inode = dir->inode;
 		free(dir);
 		fileEntry = strtok(NULL, s);
 	}
@@ -388,33 +407,41 @@ __le32 isValidDirectory(char *path) {
 	return inode;
 }
 
-
+/*
+ * Function:  printDir
+ * ------------------------
+ *  prints the directory content of a given valid directory inode number
+ *
+ *  inode: the directory inode
+ *
+ *  returns: void
+ *
+ */
 void printDir(__le32 inode) {
 	struct ext2_dir_entry_2 *dir;
-	if (!inode){
+	if (!inode) {
 		printf("Error! invalid inode\n");
-		return ;
+		return;
 	}
 	dir = getSubDir(inode, "", PRINT);
 	free(dir);
 }
 
 main() {
-int d1,d2;
+	int d1, d2;
 	struct ext2_dir_entry_2 *dir;
 
 	fid = open("/dev/fd0", O_RDWR);
 
-
 	parseSuperblock();
 	parseGroupDescriptor(0);
-	d1=isValidDirectory("/a/a1/a2/foo1");
-	d2=isValidDirectory("/a/a1");
+	d1 = isValidDirectory("/a/a1/a2/foo1");
+	d2 = isValidDirectory("/a/a1");
 
 	printDir(d2);
 
-	printf("d1 is %d  d2 is %d\n",d1,d2);
-	dir = getSubDir(EXT2_ROOT_INO, "foo2",SEARCH);
+	printf("d1 is %d  d2 is %d\n", d1, d2);
+	dir = getSubDir(EXT2_ROOT_INO, "foo2", SEARCH);
 	if (dir)
 		printf(" dir found <%s>  inode %d\n", dir->name, dir->inode);
 	else
